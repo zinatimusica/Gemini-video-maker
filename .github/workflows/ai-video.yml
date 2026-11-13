@@ -1,0 +1,429 @@
+name: AI Prompt to Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Describe the video you want (style, story, captions, voices)'
+        type: string
+        required: true
+        default: 'Recreate the style and pacing of the reference video for a new topic: Guys Math about skipping a $5 coffee then spending $2000 on a gaming setup.'
+      referenceUrl:
+        description: 'Optional: filename in repo (e.g. demo.mp4), https:// link, or leave blank to auto-use latest uploaded file'
+        type: string
+        required: false
+        default: ''
+      aspect:
+        description: 'Video Shape'
+        type: choice
+        required: true
+        default: '9:16'
+        options:
+          - '9:16'
+          - '16:9'
+
+jobs:
+  build-and-render:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo (Includes Any Uploaded Reference Videos)
+        uses: actions/checkout@v4
+
+      - name: Setup Project Skeleton
+        run: |
+          mkdir -p src public out
+
+          cat << 'EOF' > package.json
+          {
+            "name": "ai-video-agent",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@remotion/cli": "4.0.540",
+              "react": "18.3.1",
+              "react-dom": "18.3.1",
+              "remotion": "4.0.540"
+            },
+            "devDependencies": {
+              "@types/react": "18.3.12",
+              "typescript": "5.6.3"
+            }
+          }
+          EOF
+
+          cat << 'EOF' > tsconfig.json
+          {
+            "compilerOptions": {
+              "target": "ES2022",
+              "module": "CommonJS",
+              "jsx": "react-jsx",
+              "strict": false,
+              "esModuleInterop": true,
+              "resolveJsonModule": true,
+              "skipLibCheck": true
+            },
+            "include": ["src"]
+          }
+          EOF
+
+          cat << 'EOF' > src/timingTypes.ts
+          export type WordTiming = {
+            text: string;
+            start: number;
+            end: number;
+          };
+
+          export type SceneTiming = {
+            startFrame: number;
+            durationFrames: number;
+            audioFile: string;
+            subtitle: string;
+            words: WordTiming[];
+          };
+
+          export type TimingData = {
+            totalFrames: number;
+            width: number;
+            height: number;
+            scenes: SceneTiming[];
+          };
+          EOF
+
+          cat << 'EOF' > src/index.ts
+          import { registerRoot } from 'remotion';
+          import { RemotionRoot } from './Root';
+          registerRoot(RemotionRoot);
+          EOF
+
+          cat << 'EOF' > src/Root.tsx
+          import React from 'react';
+          import { CalculateMetadataFunction, Composition } from 'remotion';
+          import { GeneratedVideo } from './GeneratedVideo';
+          import timing from './timing.json';
+          import type { TimingData } from './timingTypes';
+
+          const calcMetadata: CalculateMetadataFunction<Record<string, unknown>> = () => {
+            const t = timing as TimingData;
+            return {
+              durationInFrames: Math.max(90, Number(t.totalFrames) || 300),
+              width: Number(t.width) || 1080,
+              height: Number(t.height) || 1920,
+            };
+          };
+
+          export const RemotionRoot: React.FC = () => {
+            return (
+              <Composition
+                id="AIVideo"
+                component={GeneratedVideo}
+                durationInFrames={300}
+                fps={30}
+                width={1080}
+                height={1920}
+                calculateMetadata={calcMetadata}
+              />
+            );
+          };
+          EOF
+
+      - name: Setup Node & Python
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Remotion, Audio Tools & Browser
+        run: |
+          npm install
+          pip install --quiet "edge-tts>=7.3.0" mutagen gTTS
+          npx remotion browser ensure
+
+      - name: Run AI Video Agent (Watch Reference, Write Code, Voiceover & Check)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          USER_PROMPT: ${{ github.event.inputs.prompt }}
+          REF_INPUT: ${{ github.event.inputs.referenceUrl }}
+          ASPECT: ${{ github.event.inputs.aspect }}
+        run: |
+          cat << 'EOF' > ai_agent.py
+          import asyncio, glob, json, math, mimetypes, os, re, struct, subprocess, time, urllib.error, urllib.request, wave
+          import edge_tts
+          from gtts import gTTS
+          from mutagen.mp3 import MP3
+
+          API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+          if not API_KEY:
+              raise RuntimeError("Missing GEMINI_API_KEY secret in GitHub repo settings!")
+
+          PROMPT = os.environ.get("USER_PROMPT", "").strip()
+          REF_INPUT = os.environ.get("REF_INPUT", "").strip()
+          ASPECT = os.environ.get("ASPECT", "9:16")
+          WIDTH, HEIGHT = (1920, 1080) if ASPECT == "16:9" else (1080, 1920)
+
+          EXT_MIME = {
+              ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+              ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"
+          }
+
+          def make_sfx():
+              sr = 44100
+              with wave.open("public/sfx_pop.wav", "w") as wf:
+                  wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
+                  buf = bytearray()
+                  for i in range(int(sr * 0.12)):
+                      t = i / sr
+                      val = int(18000 * math.exp(-t * 32) * math.sin(2 * math.pi * (320 + 680 * math.exp(-t * 28)) * t))
+                      buf += struct.pack("<h", max(-32767, min(32767, val)))
+                  wf.writeframes(buf)
+              with wave.open("public/sfx_whoosh.wav", "w") as wf:
+                  wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
+                  buf = bytearray()
+                  for i in range(int(sr * 0.22)):
+                      t = i / sr
+                      val = int(9500 * math.sin(math.pi * t / 0.22) * math.sin(2 * math.pi * (140 + 220 * t / 0.22) * t))
+                      buf += struct.pack("<h", max(-32767, min(32767, val)))
+                  wf.writeframes(buf)
+
+          def find_local_media(ref_input):
+              if ref_input and os.path.isfile(ref_input):
+                  return ref_input
+              candidates = []
+              for folder in ["reference", "."]:
+                  if os.path.isdir(folder):
+                      for ext in EXT_MIME:
+                          candidates.extend(glob.glob(os.path.join(folder, f"*{ext}")))
+                          candidates.extend(glob.glob(os.path.join(folder, f"*{ext.upper()}")))
+              candidates = [c for c in candidates if not c.startswith("./out") and not c.startswith("./public")]
+              if not candidates:
+                  return None
+              candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+              return candidates[0]
+
+          def upload_to_gemini_files(data_bytes, mime_type, display_name):
+              num_bytes = len(data_bytes)
+              start_req = urllib.request.Request(
+                  f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={API_KEY}",
+                  data=json.dumps({"file": {"display_name": display_name}}).encode("utf-8"),
+                  headers={
+                      "X-Goog-Upload-Protocol": "resumable",
+                      "X-Goog-Upload-Command": "start",
+                      "X-Goog-Upload-Header-Content-Length": str(num_bytes),
+                      "X-Goog-Upload-Header-Content-Type": mime_type,
+                      "Content-Type": "application/json",
+                  },
+              )
+              with urllib.request.urlopen(start_req, timeout=60) as resp:
+                  upload_url = resp.headers.get("X-Goog-Upload-URL") or resp.headers.get("x-goog-upload-url")
+              if not upload_url:
+                  raise RuntimeError("No X-Goog-Upload-URL returned from Gemini Files API")
+
+              fin_req = urllib.request.Request(
+                  upload_url,
+                  data=data_bytes,
+                  headers={
+                      "Content-Length": str(num_bytes),
+                      "X-Goog-Upload-Offset": "0",
+                      "X-Goog-Upload-Command": "upload, finalize",
+                  },
+              )
+              with urllib.request.urlopen(fin_req, timeout=180) as resp:
+                  info = json.loads(resp.read().decode("utf-8")).get("file", {})
+
+              file_name = info.get("name")
+              file_uri = info.get("uri")
+              state = info.get("state", "ACTIVE")
+              print(f"Uploaded reference to Gemini Files API: {file_name} (state={state})")
+
+              waited = 0
+              while state == "PROCESSING" and waited < 120:
+                  time.sleep(3)
+                  waited += 3
+                  chk = urllib.request.Request(f"https://generativelanguage.googleapis.com/v1beta/{file_name}?key={API_KEY}")
+                  with urllib.request.urlopen(chk, timeout=30) as r:
+                      info = json.loads(r.read().decode("utf-8"))
+                  state = info.get("state", "ACTIVE")
+                  file_uri = info.get("uri", file_uri)
+              if state == "FAILED":
+                  raise RuntimeError("Gemini failed to process the uploaded video.")
+              return {"file_data": {"mime_type": mime_type, "file_uri": file_uri}}
+
+          def get_reference_part():
+              local_file = find_local_media(REF_INPUT)
+              if local_file:
+                  ext = os.path.splitext(local_file)[1].lower()
+                  mime = EXT_MIME.get(ext, "video/mp4")
+                  print(f"Reading local reference file from repo: {local_file} ({mime})")
+                  with open(local_file, "rb") as f:
+                      return upload_to_gemini_files(f.read(), mime, os.path.basename(local_file))
+
+              if REF_INPUT.startswith("http://") or REF_INPUT.startswith("https://"):
+                  try:
+                      req = urllib.request.Request(REF_INPUT, headers={"User-Agent": "Mozilla/5.0"})
+                      with urllib.request.urlopen(req, timeout=30) as resp:
+                          ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                          data = resp.read(25 * 1024 * 1024)
+                          if ctype.startswith("image/") or ctype.startswith("video/"):
+                              print(f"Downloaded reference URL ({ctype}, {len(data)} bytes)")
+                              return upload_to_gemini_files(data, ctype, "remote_ref")
+                          else:
+                              print(f"Reference URL returned {ctype} (not direct image/video); using as text note.")
+                  except Exception as e:
+                      print("Reference URL download skipped:", e)
+              elif REF_INPUT:
+                  print(f"No file found matching '{REF_INPUT}'; proceeding with text prompt.")
+              return None
+
+          def call_gemini(parts, expect_json=True):
+              last_err = None
+              models = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"]
+              for model in models:
+                  url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={API_KEY}"
+                  gen_cfg = {"temperature": 0.7, "maxOutputTokens": 12000}
+                  if expect_json:
+                      gen_cfg["responseMimeType"] = "application/json"
+                  if "lite" not in model:
+                      gen_cfg["thinkingConfig"] = {"thinkingBudget": 1024}
+
+                  body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": gen_cfg}
+                  req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"})
+                  try:
+                      print(f"Calling {model}...")
+                      with urllib.request.urlopen(req, timeout=240) as resp:
+                          res = json.loads(resp.read().decode("utf-8"))
+                      return res["candidates"][0]["content"]["parts"][0]["text"]
+                  except urllib.error.HTTPError as he:
+                      err_txt = he.read().decode("utf-8", errors="ignore")[:400]
+                      last_err = f"HTTP {he.code}: {err_txt}"
+                      print(f"Model {model} failed:", last_err)
+                  except Exception as e:
+                      last_err = str(e)
+                      print(f"Model {model} failed:", last_err)
+              raise RuntimeError(f"All Gemini models failed: {last_err}")
+
+          async def synth_edge(text, voice, out_mp3):
+              comm = edge_tts.Communicate(text, voice, rate="+8%", boundary="WordBoundary")
+              words = []
+              with open(out_mp3, "wb") as f:
+                  async for chunk in comm.stream():
+                      if chunk["type"] == "audio":
+                          f.write(chunk["data"])
+                      elif chunk["type"] == "WordBoundary":
+                          s = chunk["offset"] / 10_000_000.0
+                          d = chunk["duration"] / 10_000_000.0
+                          words.append({"text": chunk["text"], "start": round(s, 3), "end": round(s + max(0.08, d), 3)})
+              return words
+
+          def build_audio(scenes):
+              total_frames = 0
+              out_scenes = []
+              for i, sc in enumerate(scenes):
+                  spoken = (sc.get("spoken") or "").strip()
+                  voice = sc.get("voice") or "en-US-AndrewMultilingualNeural"
+                  mp3 = f"public/scene_{i}.mp3"
+                  words, audio_file, dur_sec = [], "", 2.8
+                  if voice != "none" and spoken:
+                      try:
+                          words = asyncio.run(synth_edge(spoken, voice, mp3))
+                      except Exception as e:
+                          print(f"edge-tts fallback scene {i}:", e)
+                          if os.path.exists(mp3): os.remove(mp3)
+                      if not os.path.exists(mp3) or os.path.getsize(mp3) == 0:
+                          try:
+                              gTTS(text=spoken, lang="en").save(mp3)
+                              words = []
+                          except Exception as e:
+                              print("gTTS failed:", e)
+                      if os.path.exists(mp3) and os.path.getsize(mp3) > 0:
+                          audio_file = f"scene_{i}.mp3"
+                          alen = MP3(mp3).info.length
+                          dur_sec = max(2.2, round(alen + 0.4, 2))
+                          if not words:
+                              toks = spoken.split()
+                              step = max(0.12, (alen - 0.2) / max(1, len(toks)))
+                              words = [{"text": w, "start": round(0.1 + j * step, 3), "end": round(0.1 + (j + 1) * step, 3)} for j, w in enumerate(toks)]
+                  dur_frames = max(60, int(round(dur_sec * 30)))
+                  out_scenes.append({
+                      "startFrame": total_frames,
+                      "durationFrames": dur_frames,
+                      "audioFile": audio_file,
+                      "subtitle": sc.get("subtitle") or spoken,
+                      "words": words,
+                  })
+                  total_frames += dur_frames
+              return {"totalFrames": total_frames, "width": WIDTH, "height": HEIGHT, "scenes": out_scenes}
+
+          make_sfx()
+
+          system_spec = f"""You are an elite Remotion 4 motion graphics engineer.
+          If a reference image or video is attached, FIRST study its exact visual style, layout, colors, pacing, typography, character/UI/chart elements, and camera motion, and recreate that style cleanly for the user's prompt in {WIDTH}x{HEIGHT} (30fps).
+          Return ONLY valid JSON with two keys:
+          1. "scenes": array of 3 to 8 scene objects, each with:
+             - "voice": one of ["en-US-AndrewMultilingualNeural", "en-US-GuyNeural", "en-US-AvaNeural", "en-GB-RyanNeural", "none"]
+             - "spoken": punchy spoken line
+             - "subtitle": crisp subtitle text
+          2. "videoTsx": a complete TypeScript file for src/GeneratedVideo.tsx exporting `GeneratedVideo: React.FC`.
+
+          EXACT TYPES & RULES FOR videoTsx:
+          - Import ONLY from 'react', 'remotion', './timingTypes', and `import rawTiming from './timing.json';`.
+          - Allowed 'remotion' imports: AbsoluteFill, Audio, Sequence, interpolate, spring, staticFile, useCurrentFrame, useVideoConfig.
+          - Cast timing cleanly: `const timing = rawTiming as TimingData;`
+          - Exact `TimingData` shape from `./timingTypes`:
+            `WordTiming = {{ text: string; start: number; end: number }}` (seconds!)
+            `SceneTiming = {{ startFrame: number; durationFrames: number; audioFile: string; subtitle: string; words: WordTiming[] }}`
+          - Loop over `timing.scenes` with `<Sequence key={{i}} from={{sc.startFrame}} durationInFrames={{sc.durationFrames}}>`.
+          - Inside each scene play `{{sc.audioFile ? <Audio src={{staticFile(sc.audioFile)}} /> : null}}` and `{{i > 0 ? <Audio src={{staticFile('sfx_whoosh.wav')}} volume={{0.3}} /> : null}}`.
+          - Use valid React CSS properties ONLY (`justifyContent`, `alignItems`, `fontStyle: 'italic'` — NEVER `justify`, `align`, or `italic`).
+          - Draw expressive inline `<svg>` scenes/characters/UI/charts and bold readable captions. NEVER use `Math.random()`."""
+
+          parts = [{"text": system_spec + f"\n\nUSER PROMPT:\n{PROMPT}"}]
+          ref_part = get_reference_part()
+          if ref_part:
+              parts.append(ref_part)
+
+          raw = call_gemini(parts, expect_json=True)
+          raw = re.sub(r"^```json\s*|\s*```$", "", raw.strip())
+          plan = json.loads(raw)
+
+          timing = build_audio(plan["scenes"])
+          with open("src/timing.json", "w", encoding="utf-8") as f:
+              json.dump(timing, f, ensure_ascii=False)
+
+          tsx_code = plan["videoTsx"]
+          with open("src/GeneratedVideo.tsx", "w", encoding="utf-8") as f:
+              f.write(tsx_code)
+
+          for attempt in range(3):
+              proc = subprocess.run(["npx", "tsc", "--noEmit"], capture_output=True, text=True)
+              if proc.returncode == 0:
+                  print("TypeScript check passed!")
+                  break
+              err = (proc.stdout + "\n" + proc.stderr).strip()
+              print(f"TS error on attempt {attempt+1}:\n{err}")
+              if attempt == 2:
+                  raise RuntimeError("TypeScript failed after 2 auto-fix attempts:\n" + err)
+              fix_prompt = f"""Fix the TypeScript errors in src/GeneratedVideo.tsx below. Return ONLY the complete fixed TypeScript code (no markdown fences).
+
+          ERROR:
+          {err}
+
+          CODE:
+          {tsx_code}"""
+              fixed = call_gemini([{"text": fix_prompt}], expect_json=False)
+              tsx_code = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", fixed.strip())
+              with open("src/GeneratedVideo.tsx", "w", encoding="utf-8") as f:
+                  f.write(tsx_code)
+          EOF
+          python3 ai_agent.py
+
+      - name: Render MP4 Video
+        run: npx remotion render src/index.ts AIVideo out/video.mp4 --codec=h264
+
+      - name: Upload MP4
+        uses: actions/upload-artifact@v7
+        with:
+          path: out/video.mp4
+          archive: false
+          retention-days: 7
